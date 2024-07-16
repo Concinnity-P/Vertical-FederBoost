@@ -1,0 +1,9 @@
+Log/
+Plots/
+test.py
+.vscode
+Saves/
+gitignore
+__pycache__/
+SFXGBoost/__pycache__/
+FederBoost.code-workspace
