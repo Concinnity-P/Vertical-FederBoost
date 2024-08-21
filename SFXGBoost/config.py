@@ -18,8 +18,9 @@ np.set_printoptions(precision=4, suppress=True)
 
 class Config:
     def __init__(self, experimentName:str, nameTest:str, model:str, dataset:str, lam:float, gamma:float, 
-                 alpha:float, learning_rate:float, max_depth:int, max_tree:int, nBuckets:int, save:bool=True, 
-                 target_rank:int=0, data_devision:list=[0.5, 0.5], train_size:int=2000, client:int=0, num_client:int=2):
+                 alpha:float, learning_rate:float, max_depth:int, max_tree:int, nBuckets:int, total_feature:int, client_feature:int,
+                   save:bool=True, target_rank:int=0, data_devision:list=[0.5, 0.5], train_size:int=2000, client:int=0, num_client:int=2,
+                 ):
         self.experimentName = experimentName
         self.nameTest = nameTest
         self.model = model
@@ -41,6 +42,8 @@ class Config:
         self.num_client = num_client
         self.save_location= "./Saves/" + nameTest + "_rank_" + str(self.client)
         # self.save_location= "/mnt/scratch_dir/meerhofj/Saves/" + experimentName + "/" + nameTest + "_rank_" + str(self.client)
+        self.total_feature = total_feature
+        self.client_feature = client_feature
 
     def prettyprint(self):
         print(f"experiment name = {self.experimentName}")
