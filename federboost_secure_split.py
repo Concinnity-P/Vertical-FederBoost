@@ -1,4 +1,4 @@
-from SFXGBoost.Model import SFXGBoost, devide_D_Train
+from SFXGBoost.Model import SFXGBoost, devide_D_Train, VFLXGBoost
 from SFXGBoost.config import Config, MyLogger
 from SFXGBoost.dataset.datasetRetrieval import getDataBase
 from ddsketch import DDSketch
@@ -11,10 +11,18 @@ from copy import deepcopy
 import pandas as pd
 from datetime import date
 import time
+from phe import paillier
+public_key, private_key = paillier.generate_paillier_keypair(n_length=100)
+from typing import List
+from SFXGBoost.data_structure.treestructure import SplittingInfo
+from SFXGBoost.loss.softmax import getLoss
 
 dataset = 'whales_prediction' #'whales_prediction'# 'iris' #'healthcare'
 NUM_CLIENTS = 3
 DATA_DEVISION = [1/NUM_CLIENTS] * NUM_CLIENTS
+
+NUM_FEATURE = 58
+NUM_FEATURE_CLIENT = [18, 20, 20]
 
 config = Config(experimentName = "experiment 1",
         nameTest= dataset + " test",
@@ -24,18 +32,20 @@ config = Config(experimentName = "experiment 1",
         gamma=0, # 0.5
         alpha=0.0,
         learning_rate=0.3, #0.3, 0.75
-        max_depth=6,
-        max_tree=20,
+        max_depth=3,
+        max_tree=10,
         nBuckets=100,#100
         save=False,
         data_devision=DATA_DEVISION,
         train_size=10_000,
         client=0,
-        num_client=NUM_CLIENTS
+        num_client=NUM_CLIENTS,
+        total_feature=NUM_FEATURE,
+        client_feature=0
         )
 
 configs:list[Config] = []
-for i in range(config.num_client+1):
+for i in range(config.num_client):
     configs.append(Config(experimentName = "experiment 1",
         nameTest= config.nameTest,
         model=config.model,
@@ -50,13 +60,15 @@ for i in range(config.num_client+1):
         save=False,
         data_devision=config.data_devision,
         train_size=config.train_size,
-        client=i, # 0 is server
-        num_client=config.num_client
+        client=i, # 0 is server | 0 is the participant holds the label
+        num_client=config.num_client,
+        total_feature=config.total_feature,
+        client_feature=NUM_FEATURE_CLIENT[i]
         ))
                           
 
 loggers = []
-for i in range(config.num_client+1):
+for i in range(config.num_client):
     loggers.append(MyLogger(configs[i]).logger)
 
 
@@ -90,65 +102,115 @@ from getData import getWhaleDate
 train_df_shuffle, y = getWhaleDate()
 
 X_train = train_df_shuffle.values
-y_train = encoder.fit_transform(y.values.reshape(-1, 1)).toarray()
+y = encoder.fit_transform(y.values.reshape(-1, 1)).toarray()
 fName = train_df_shuffle.columns
 
 
-# split data
+# # split data
 total_users = config.num_client # participants
 
 X_train_list = []
-y_train_list = []
+X_test_list = []
+# y_train_list = []
 
-for rank in range(total_users):
-    rank += 1
-    X_train_my, y_train_my = devide_D_Train(X_train, y_train, rank, config.data_devision)
-    X_train_list.append(X_train_my)
-    y_train_list.append(y_train_my)
+# for rank in range(total_users):
+#     rank += 1
+#     X_train_my, y_train_my = devide_D_Train(X_train, y_train, rank, config.data_devision)
+#     X_train_list.append(X_train_my)
+#     y_train_list.append(y_train_my)
+
+
+X_train_list.append(X_train[:12000,:20])
+X_train_list.append(X_train[:12000,20:40])
+X_train_list.append(X_train[:12000,40:])
+X_test_list.append(X_train[12000:,:20])
+X_test_list.append(X_train[12000:,20:40])
+X_test_list.append(X_train[12000:,40:])
+
+
+y_train = y[:12000]
+y_test = y[12000:]
+
+fName_list = [fName[:20], fName[20:40], fName[40:]]
 
 # sketchs = [DDSketch() for _ in range(total_users)]
 # sketch = DDSketch()
 res_to_merge = []
 bst_clients:list[SFXGBoost] = []
 for i in range(total_users):
-    bst_client = SFXGBoost(configs[i+1], loggers[i+1])   
-    res = bst_client.participant_fit(X_train_list[i], y_train_list[i], fName)
+    bst_client = SFXGBoost(configs[i], loggers[i])
+    if i == 0:
+        res = bst_client.participant_fit(X_train_list[i], X_test_list[i], fName_list[i], fName, y_train, y_test  )
+    else:
+        res = bst_client.participant_fit(X_train_list[i], X_test_list[i], fName_list[i], fName)
     res_to_merge.append(res)
     bst_clients.append(bst_client)
 
 # merge the results in server
-splitCandidates = []
-for i in range(len(res_to_merge[0])):
-    if all([isinstance(res_to_merge[p][i][1], np.ndarray)  for p in range(total_users)]):
-        combined_array = np.concatenate([res_to_merge[p][i][1] for p in range(total_users)], axis=0)
-        if np.unique(combined_array).shape[0] > config.nBuckets + 1:
-            sketch = DDSketch()
-            for j in range(total_users):
-                sketch.merge(res_to_merge[j][i][0])
-            quantiles = np.array([sketch.get_quantile_value(q/config.nBuckets) for q in range(0, config.nBuckets, 1)])
-            splitCandidates.append(np.unique(np.round(quantiles,4)))
-        else:
-            splitCandidates.append(np.unique(combined_array))
-    else:
-        sketch = DDSketch()
-        for j in range(total_users):
-            sketch.merge(res_to_merge[j][i][0])
-        quantiles = np.array([sketch.get_quantile_value(q/config.nBuckets) for q in range(0, config.nBuckets, 1)])
-        splitCandidates.append(np.unique(np.round(quantiles,4)))
+splitCandidates = res_to_merge[0].copy()
+splitCandidates.extend(res_to_merge[1])
+splitCandidates.extend(res_to_merge[2])
+# for i in range(len(res_to_merge[0])):
+#     if all([isinstance(res_to_merge[p][i][1], np.ndarray)  for p in range(total_users)]):
+#         combined_array = np.concatenate([res_to_merge[p][i][1] for p in range(total_users)], axis=0)
+#         if np.unique(combined_array).shape[0] > config.nBuckets + 1:
+#             sketch = DDSketch()
+#             for j in range(total_users):
+#                 sketch.merge(res_to_merge[j][i][0])
+#             quantiles = np.array([sketch.get_quantile_value(q/config.nBuckets) for q in range(0, config.nBuckets, 1)])
+#             splitCandidates.append(np.unique(np.round(quantiles,4)))
+#         else:
+#             splitCandidates.append(np.unique(combined_array))
+#     else:
+#         sketch = DDSketch()
+#         for j in range(total_users):
+#             sketch.merge(res_to_merge[j][i][0])
+#         quantiles = np.array([sketch.get_quantile_value(q/config.nBuckets) for q in range(0, config.nBuckets, 1)])
+#         splitCandidates.append(np.unique(np.round(quantiles,4)))
 
 splitCandidates_dict = {fName[i]: splitCandidates[i] for i in range(len(splitCandidates))}
+for i in range(total_users):
+    bst_clients[i].setSplits(splitCandidates)
 
-
+splitCandidates_dict_list = []
+for i in range(total_users):
+    splitCandidates_dict_list.append({fName_list[i][j]: res_to_merge[i][j] for j in range(len(res_to_merge[i]))})
 
 # client update splits
 for i in range(total_users):
-    bst_clients[i].setquantiles(splitCandidates_dict)
+    bst_clients[i].setquantiles(splitCandidates_dict_list[i])
 
-bst = SFXGBoost(configs[0], loggers[0]) # server model
-bst.server_fit(fName,splitCandidates)
+# bst = SFXGBoost(configs[0], loggers[0]) # server model
+# bst.server_fit(fName,splitCandidates)
 
 # a = FitRes(Status(Code.OK, "OK"), Parameters([bst], ""), 0, {})
 
+bst = bst_clients[0]
+
+
+vfl_model = VFLXGBoost(bst_clients)
+
+#define update function to comunicate with clients
+def update(bst_clients:List[SFXGBoost], update_infos:List[List[SplittingInfo]], d):
+    instances_list = []
+    for c in range(config.nClasses):
+        # if d == config.max_depth :
+        #     break
+        instances_list.append([])
+        for n, update_info in enumerate(update_infos[c]):
+            featureid = update_info.featureId
+            # if update_info.isValid:
+            if featureid is not None:
+                if featureid < 20:
+                    clientid = 0
+                elif featureid < 40:
+                    clientid = 1
+                else:
+                    clientid = 2
+            else: 
+                clientid = 0
+            instances_list[c].append(bst_clients[clientid].split_instances(update_info,  c, n))
+    return instances_list
 
 
 # training
@@ -158,22 +220,69 @@ for t in range(config.max_tree):
     print(f"Tree {t}:")
     for d in range(config.max_depth + 1):
         print(f"Depth {d}:")
-        GHs = []
+        if d == 0:
+            G, H = bst.participant_boost(t, d)
+            # GHs = []
+            # for i in range(total_users):
+            #     GH = bst_clients[i].participant_boost(t, d)
+            #     GHs.append(GH)
+
+            #encryption
+            G_encrypted = []
+            H_encrypted = []
+            for c in range(config.nClasses):
+                G_encrypted.append([public_key.encrypt(g) for g in G[c]])
+                H_encrypted.append([public_key.encrypt(h) for h in H[c]])
+            G_encrypted = np.array(G_encrypted)
+            H_encrypted = np.array(H_encrypted)
+        
+        # gcn, hcn = bst.appendGradients(bst.currentNodes[0][0].instances ,G_encrypted[0], H_encrypted[0])
+        #sending to all clients
+        res = []
         for i in range(total_users):
-            GH = bst_clients[i].participant_boost(t, d)
-            GHs.append(GH)
-        update_info = bst.server_boost(GHs, t, d)
-        train_losses = np.array([])
-        test_losses = np.array([])
+            res.append(bst_clients[i].participant_appendGradients(G_encrypted, H_encrypted, t, d, public_key.encrypt(0)))
+        
+        GH =  deepcopy(res[0])
+
+ 
+
+        for i in range(1,total_users):
+            for c in range(config.nClasses):
+                for n in range(len(GH[0][c])):
+                    GH[0][c][n].extend(res[i][0][c][n])
+                    GH[1][c][n].extend(res[i][1][c][n])
+
+        # decrytion
+        for c in range(config.nClasses):
+            for n in range(len(GH[0][c])):
+                for k in range(config.nFeatures):
+                    GH[0][c][n][k] = [private_key.decrypt(g) for g in GH[0][c][n][k]]
+                    GH[1][c][n][k] = [private_key.decrypt(h) for h in GH[1][c][n][k]]
+
+
+        update_info = bst.server_boost([GH], t, d)
+        # train_losses = np.array([])
+        # test_losses = np.array([])
+        instances_list = update(bst_clients, update_info, d)
         for i in range(total_users):
-            loss = bst_clients[i].participant_update(update_info, t, d) #return train loss and test loss
-            train_losses = np.append(train_losses, loss[0])
-            test_losses = np.append(test_losses, loss[1])
-        if d == (config.max_depth ):
-            print(f"Train loss: {np.mean(train_losses)}")
-            print(f"Test loss: {np.mean(test_losses)}")
-            bst.losslog_train.append(np.mean(train_losses))
-            bst.losslog_test.append(np.mean(test_losses))
+            bst_clients[i].tree_update(update_info, instances_list,t, d)
+            # loss = bst_clients[i].participant_update(update_info, t, d) #return train loss and test loss
+            # train_losses = np.append(train_losses, loss[0])
+            # test_losses = np.append(test_losses, loss[1])
+        if d == config.max_depth :
+            vfl_model.update()
+            train_loss = bst.losslog_train[-1]
+            print(f"Train loss: {train_loss}")
+
+            y_pred_test = vfl_model.predict_proba(None, t = t)
+            y_true = bst_clients[0].y_test
+            test_loss = getLoss(y_true, y_pred_test)
+            print(f"Test loss: {test_loss}")
+            bst.losslog_test.append(test_loss)
+
+
+            # bst.losslog_train.append(np.mean(train_losses))
+            # bst.losslog_test.append(np.mean(test_losses))
             if t == config.max_tree - 1:
                 plot_loss(bst.losslog_train,bst.losslog_test,config)
     print(f"Time for tree {t}: {round(time.time() - current_time, 0)}s")
@@ -200,14 +309,14 @@ curTime = time.strftime("%H:%M", time.localtime())
 for i in range(total_users):
 
     
-    bst_save = SFXGBoost(configs[i+1], loggers[i+1])
+    bst_save = bst_clients[i]
 
-    bst_save.trees = bst_clients[i].trees
-    bst_save.fName = fName
-    bst_save.X_test = bst_clients[i].X_test
-    bst_save.y_test = bst_clients[i].y_test
-    bst_save.X_train = bst_clients[i].X_train
-    bst_save.y_train = bst_clients[i].y_train
+    # bst_save.trees = bst_clients[i].trees
+    # bst_save.fName = fName
+    # bst_save.X_test = bst_clients[i].X_test
+    # bst_save.y_test = bst_clients[i].y_test
+    # bst_save.X_train = bst_clients[i].X_train
+    # bst_save.y_train = bst_clients[i].y_train
 
     # print(bst_save.predict(X_train))
 
