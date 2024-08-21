@@ -18,6 +18,8 @@ class SplittingInfo:
 
         self.weight = weight
         self.nodeScore = nodeScore
+        self.splitclient = None #[0,1,2]
+        self.recordid = None # for lookup table
 
     def delSplittinVector(self): # performance attempt
         self.bestSplittingVector = None
