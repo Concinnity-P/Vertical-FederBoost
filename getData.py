@@ -152,3 +152,7 @@ def getWhaleDate():
         index = train_df_shuffle.index
     )
     return train_df_shuffle, y
+
+if __name__ == '__main__':
+    X, y = getWhaleDate()
+    print(X.shape)
