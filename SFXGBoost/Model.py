@@ -1,7 +1,7 @@
 from SFXGBoost.config import Config, NUM_CLIENTS
 from logging import Logger
 import numpy as np
-from SFXGBoost.data_structure.treestructure import FLTreeNode, SplittingInfo
+from SFXGBoost.data_structure.treestructure import FLTreeNode, SplittingInfo, TreeNode
 from copy import deepcopy
 from SFXGBoost.data_structure.databasestructure import QuantiledDataBase, DataBase
 from SFXGBoost.common.XGBoostcommon import PARTY_ID, L, Direction, weights_to_probas
@@ -13,6 +13,7 @@ from SFXGBoost.view.plotter import plot_loss  # last month loss logging
 from ddsketch import DDSketch
 from sklearn.model_selection import train_test_split
 from typing import Union
+import pandas as pd
 
 class MSG_ID:
     TREE_UPDATE = 69
@@ -68,13 +69,13 @@ class SFXGBoostClassifierBase:
         self.nFeatures = len(fName)
         self.y = y
         # print(f"DEBUG: setting rank: {rank}'s FNAME to be = {self.fName} ")
-        if self.config.client != 0:
-            nUsers = original_data.nUsers
-            self.nUsers = nUsers
-            for treesofclass in self.trees:
-                for tree in treesofclass:
-                    assert type(tree) == SFXGBoostTree
-                    tree.setInstances(nUsers, np.full((nUsers, ), True)) # sets all root nodes to have all instances set to True
+        # if self.config.client != 0:
+        nUsers = original_data.nUsers
+        self.nUsers = nUsers
+        for treesofclass in self.trees:
+            for tree in treesofclass:
+                assert type(tree) == SFXGBoostTree
+                tree.setInstances(nUsers, np.full((nUsers, ), True)) # sets all root nodes to have all instances set to True
     
     def copyquantiles(self):
         self.quantileDB.featureDict
@@ -349,8 +350,15 @@ class SFXGBoost(SFXGBoostClassifierBase):
                     if score > maxScore:# and Hl > 1 and Hr > 1: # TODO 1 = min_child_weight
                         value = splits[k][v]
                         featureId = k
-                        featureName = self.fName[k]
+                        featureName = self.full_fName[k]
                         maxScore = score
+                        Hl_max = Hl
+                        Hr_max = Hr
+                        Gl_max = Gl
+                        Gr_max = Gr
+        # if is_second_last_level:
+        #     weight_L, score_L = FLTreeNode.compute_leaf_param(Gl_max, Hl_max, self.config.lam, self.config.alpha)
+        #     weight_R, score_R = FLTreeNode.compute_leaf_param(Gr_max, Hr_max, self.config.lam, self.config.alpha)
 
         # print(featureName)
         # print(value)
@@ -396,7 +404,8 @@ class SFXGBoost(SFXGBoostClassifierBase):
 
         return new_nodes
 
-    def appendGradients(self, instances, G, H, orgData):
+    def appendGradients(self, instances, G, H, encrypted_zero):
+        orgData = deepcopy(self.original_data)
         Gkv = []  #np.zeros((self.nClasses, amount_of_bins))
         Hkv = []
         # G, H = (nUsers,)
@@ -406,10 +415,12 @@ class SFXGBoost(SFXGBoostClassifierBase):
         for fName, fData in self.quantileDB.featureDict.items():
             splits = self.quantileDB.featureDict[fName].splittingCandidates
             # Dxk = np.zeros((np.shape(splits)[0] + 1, ))
-            Gk =  np.zeros((np.shape(splits)[0] + 1, ))
-            Hk =  np.zeros((np.shape(splits)[0] + 1, ))
+            Gk =  [encrypted_zero for _ in range(np.shape(splits)[0] + 1)]
+            Hk =  [encrypted_zero for _ in range(np.shape(splits)[0] + 1)]
 
-            data = orgData.featureDict[fName]
+            # Gk = 
+
+            data = fData.data
             gradients = G
             hessians = H
 
@@ -431,7 +442,7 @@ class SFXGBoost(SFXGBoostClassifierBase):
             Hkv.append(Hk)
 
             k -=- 1
-        return Gkv, Hkv, None
+        return Gkv, Hkv
         # comm.send((Gkv, Hkv, Dx), PARTY_ID.SERVER, tag=MSG_ID.RESPONSE_GRADIENTS)
 
     def appendGradientsVectorized(self, instances, G, H, orgData):
@@ -599,6 +610,23 @@ class SFXGBoost(SFXGBoostClassifierBase):
                 y_pred[:, c] += update_pred #* self.config.learning_rate
         return y_pred
     
+    def pred_weight_vectical(self, X, pi=-1, t=None):
+        y_pred = np.zeros((len(X), self.config.nClasses))
+        data_num = X.shape[0]
+        # Make predictions
+        testDataBase = DataBase.data_matrix_to_database(X, self.fName)
+        treesToTest = -1
+        if t is None:
+            treesToTest = self.config.max_tree
+        else:
+            treesToTest = t
+        for treeID in range(treesToTest):
+            for c in range(self.config.nClasses):
+                tree = self.trees[c][treeID]
+                # Estimate gradient and update prediction
+                update_pred = tree.predict(testDataBase, pi)
+                y_pred[:, c] += update_pred
+        return y_pred
 
 
     # my functions  ####
@@ -615,42 +643,55 @@ class SFXGBoost(SFXGBoostClassifierBase):
         self.H = None
         return self
 
-    def participant_fit(self, X_train:np.ndarray, y_train, fName) -> List[List[ Union[DDSketch, bool, np.ndarray]]]:
-        X_train, X_test, y_train, y_test = train_test_split(X_train, y_train, test_size=0.2, random_state=42, stratify=y_train)
+    def participant_fit(self, X_train:np.ndarray, X_test, fName, full_fName,y_train = None,y_test = None) -> List[List[ Union[DDSketch, bool, np.ndarray]]]:
+        # X_train, X_test, y_train, y_test = train_test_split(X_train, y_train, test_size=0.2, random_state=42, stratify=y_train)
         
         self.X_test = X_test
         self.y_test = y_test
         self.X_train = X_train
         self.y_train = y_train
+        self.full_fName = full_fName
         
         quantile = QuantiledDataBase(DataBase.data_matrix_to_database(X_train, fName), self.config )
         nBuckets = self.config.nBuckets
         original = DataBase.data_matrix_to_database(X_train, fName)
         self.setData(quantile, fName, original, y_train)
-        sketches = [DDSketch() for _ in range(len(fName))]
+        # sketches = [DDSketch() for _ in range(len(fName))]
+        self.original_data_test = DataBase.data_matrix_to_database(X_test, fName)
 
-        results = [ [] for _ in range(len(fName))]
-
+        splits = np.linspace(0, 1, nBuckets+1)
+        results = []
+        quantile = pd.DataFrame(X_train).quantile(splits)
         for i, fName in enumerate(fName):
-            fData = X_train[:, i]
-            sketch = sketches[i]
-            for value in fData:
-                sketch.add(value)
-            results[i].append(sketch)
+            fData  = X_train[:, i]
             if len(np.unique(fData)) > nBuckets+1:
-                results[i].append(False)
+                results.append(np.unique(quantile.iloc[:, i].values))
             else:
-                results[i].append(np.unique(fData))
+                results.append(np.unique(fData))
+
+        # for i, fName in enumerate(fName):
+        #     fData = X_train[:, i]
+        #     sketch = sketches[i]
+        #     for value in fData:
+        #         sketch.add(value)
+        #     results[i].append(sketch)
+        #     if len(np.unique(fData)) > nBuckets+1:
+        #         results[i].append(False)
+        #     else:
+        #         results[i].append(np.unique(fData))
         
         self.currentTree = -1
         self.G = None
         self.H = None
 
-        initprobability = (sum(y_train))/len(y_train)
-        y_pred = np.tile(initprobability, (len(X_train), 1))
-        # y_pred = np.zeros((self.nUsers, self.config.nClasses))
+
+        if self.config.client == 0:
+            # initprobability = (sum(y_train))/len(y_train)
+            # initprobability = np.log(initprobability / (1 - initprobability))
+            # y_pred = np.tile(initprobability, (len(X_train), 1))
+            y_pred = np.zeros((self.nUsers, self.config.nClasses))
         # y_pred = np.random.random(size=(self.nUsers, self.config.nClasses))
-        self.pred = y_pred
+            self.pred = y_pred
 
         return results
         
@@ -715,8 +756,8 @@ class SFXGBoost(SFXGBoostClassifierBase):
                 split_cn = self.find_split(splits, G[c][i], H[c][i], d == self.config.max_depth)
                 splittingInfos[c].append(split_cn)
         
-        nodes = self.update_trees(nodes, splittingInfos, d)
-        self.currentNodes = nodes
+        # nodes = self.update_trees(nodes, splittingInfos, d)
+        # self.currentNodes = nodes
         # update_pred = np.array([tree.predict(self.original_data) for tree in self.trees[:, t]]).T
         # self.pred += update_pred * self.config.learning_rate
         
@@ -745,6 +786,9 @@ class SFXGBoost(SFXGBoostClassifierBase):
         self.logger.warning(f"Server sending splits.")
         return splittingInfos
 
+
+
+
     def participant_boost(self, t, d):
         """_summary_
 
@@ -772,9 +816,11 @@ class SFXGBoost(SFXGBoostClassifierBase):
             # self.currentDepth = 0
 
             # update prediction
-            if t >= 1:
-                self.pred += np.array([tree.predict(deepcopy(self.original_data)) for tree in self.trees[:, t-1]]).T
+            # if t >= 1:
+                # self.pred += np.array([tree.predict(deepcopy(self.original_data)) for tree in self.trees[:, t-1]]).T
+                #find all the leaves, get the instances and weights to update the prediction
 
+                        
 
 
 
@@ -788,7 +834,7 @@ class SFXGBoost(SFXGBoostClassifierBase):
             self.currentNodes = nodes
         else:
             nodes = self.currentNodes
-        
+        return G, H
         Gnodes = [[] for _ in range(self.config.nClasses)]
         Hnodes = [[] for _ in range(self.config.nClasses)]
 
@@ -809,6 +855,30 @@ class SFXGBoost(SFXGBoostClassifierBase):
         #     FLVisNode(self.logger, self.trees[c][t].root).display(t)
         update_pred = np.array([tree.predict(orgData) for tree in self.trees[:, t]]).T
         self.pred += update_pred * self.config.learning_rate
+
+    def participant_appendGradients(self, G, H, t, d, encrpted_zero):
+        if d == 0:
+            nodes = [[self.trees[c][t].root] for c in range(self.config.nClasses)]
+            self.currentNodes = nodes
+        else:
+            nodes = self.currentNodes
+        Gnodes = [[] for _ in range(self.config.nClasses)]
+        Hnodes = [[] for _ in range(self.config.nClasses)]
+       
+        for c in range(self.config.nClasses):
+            for node in nodes[c]:
+                instances = node.instances
+                # print(instances)
+                gcn, hcn = self.appendGradients(instances, G[c], H[c], encrpted_zero)
+                # assert len(gcn) == 16
+                Gnodes[c].append(gcn)
+                Hnodes[c].append(hcn)
+
+        # self.logger.warning(f"Client{self.config.client} sending G,H")
+        print(f"Client{self.config.client} sending G,H")
+        return (Gnodes, Hnodes)
+
+
     def participant_update(self, splitinfo, t, d):
 
         newnodes = self.update_trees(self.currentNodes, splitinfo, d)
@@ -839,6 +909,111 @@ class SFXGBoost(SFXGBoostClassifierBase):
         # if t > self.currentTree:
         #     self.currentTree = t
         #     self.currentDepth = d
+    def direction(self, userid, recordid, test = False):
+        feature, value = self.lookuptable[recordid]  
+        data = self.original_data.featureDict[feature].data[userid] if test else self.original_data_test.featureDict[feature].data[userid]
+        if data <= value:
+            return Direction.LEFT
+        else:
+            return Direction.RIGHT
+        
+    def split_instances(self, split:SplittingInfo, c , nodeid):
+        node = self.currentNodes[c][nodeid]
+        fName = split.featureName
+        sValue = split.splitValue
+        if split.isValid:
+            L = np.logical_and([self.original_data.featureDict[fName][index] <= sValue for index in range(self.nUsers)], node.instances)
+            R = np.logical_and([self.original_data.featureDict[fName][index] > sValue for index in range(self.nUsers)], node.instances)
+            return (L, R)
+        else:
+            return (None, None)
+    
+    def split_instances_test(self, split:SplittingInfo, parentinstances):
+        # node = self.trees[c][nodeid]
+        fName = split.featureName
+        sValue = split.splitValue
+        if split.isValid:
+            L = np.logical_and([self.original_data_test.featureDict[fName][index] <= sValue for index in range(self.original_data_test.nUsers)], parentinstances)
+            R = np.logical_and([self.original_data_test.featureDict[fName][index] > sValue for index in range(self.original_data_test.nUsers)], parentinstances)
+            return (L, R)
+        else:
+            return (None, None)
+    
+    def tree_update(self, splits:List[List[SplittingInfo]], instance_list, t, depth):
+        new_nodes = [[] for _ in range(self.config.nClasses)]
+        for c in range(self.config.nClasses):
+            for n, node in enumerate(self.currentNodes[c]):
+                splitInfo = splits[c][n]
+                if splitInfo.isValid and depth < self.config.max_depth:
+                    node.splittingInfo = splitInfo
+                    node.leftBranch = FLTreeNode(parent=node)
+                    node.rightBranch = FLTreeNode(parent=node)
+                    fName = splitInfo.featureName
+                    sValue = splitInfo.splitValue
+                    # print(self.original_data.featureDict.keys())
+                    # if self.config.client != 0:
+                    node.leftBranch.instances = instance_list[c][n][0]
+                    node.rightBranch.instances = instance_list[c][n][1]
+                    new_nodes[c].append(node.leftBranch)
+                    new_nodes[c].append(node.rightBranch)
+                else:  # leaf node
+                    node.weight = splitInfo.weight
+                    # for p in range(0, self.config.num_client):
+                        # if self.config.client == 0 and self.config.target_rank > 0:
+                        #     # print(f"DEBUG gpi shape{np.array(node.Gpi[p]).shape}")
+                        #     w, scorep = FLTreeNode.compute_leaf_param(node.Gpi[p][0], node.Hpi[p][0], self.config.lam, self.config.alpha) 
+                        #     node.weightpi[p] = w * self.config.learning_rate
+                    node.score = splitInfo.nodeScore
+                    node.leftBranch = None
+                    node.rightBranch = None
+
+                    # self.nodes[c][depth].append(node) # only add leaf nodes maybe?
+        self.currentNodes = new_nodes
+        if self.config.client == 0:
+            if not hasattr(self, 'losslog_train') and not hasattr(self, 'losslog_test'):
+                self.losslog_train = []
+                self.losslog_test = []
+            if depth == self.config.max_depth:
+
+                #evaluation
+                
+                # y_pred_train = self.predict_proba(self.X_train, t=t+1)
+
+                instance = [[] for _ in range(self.config.nClasses)]
+                weight = [[] for _ in range(self.config.nClasses)]
+                for c in range(self.config.nClasses):
+                    curNode = self.trees[:, t][c].root
+                    def get_leaves(node):
+                        if node.is_leaf():
+                            instance[c].append(node.instances)
+                            weight[c].append(node.weight)
+                        else:
+                            get_leaves(node.leftBranch)
+                            get_leaves(node.rightBranch)
+                    get_leaves(curNode)
+                self.pred += (np.array(instance).astype(int) *  np.array(weight)[:, :, np.newaxis]).sum(axis=1).T
+
+                y_pred_max = np.max(self.pred, axis=1, keepdims=True)
+                y_pred_stable = self.pred - y_pred_max
+                exp_y_pred = np.exp(y_pred_stable)
+                sum_exp_y_pred = np.sum(exp_y_pred, axis=1, keepdims=True)
+                # y_pred = 1/(1+np.exp(-self.pred ))
+                y_pred = exp_y_pred / sum_exp_y_pred
+                y_true = self.y_train
+                train_loss = getLoss(y_true, y_pred)
+                self.losslog_train.append(train_loss)
+                # del y_pred_train
+                # y_pred_test = self.predict_proba(self.X_test, t=t+1)
+                # y_true = self.y_test
+                # test_loss = getLoss(y_true, y_pred_test)
+                # self.losslog_test.append(test_loss)
+                # return [train_loss, test_loss]
+            
+            # if t > 0:
+            #     return [self.losslog_train[-1], self.losslog_test[-1]]
+            # else:
+            #     return [None, None]
+
         
 
              
@@ -848,6 +1023,7 @@ class SFXGBoostTree:
         self.id = id
         self.root = FLTreeNode()
         self.nNode = 0
+        self.testsplit = False
         # self.G = None 
         # self.H = None
         # self.Gpi = [ [] for _ in range(comm.Get_size() - 1)]
@@ -875,4 +1051,161 @@ class SFXGBoostTree:
                 outputs[userId] = curNode.weightpi[pi-1]
             # TODO add weightpi return
         return outputs
+
+    def vertical_predict(self, ids):
+        curNode = self.root
+        output = np.empty(len(ids), dtype=float)
+
+        instance = [[] for _ in range(self.config.nClasses)]
+        weight = [[] for _ in range(self.config.nClasses)]
+        for c in range(self.config.nClasses):
+            curNode = self.trees[:, t-1][c].root
+            def get_leaves(node):
+                if node.is_leaf():
+                    instance[c].append(node.instances)
+                    weight[c].append(node.weight)
+                else:
+                    get_leaves(node.leftBranch)
+                    get_leaves(node.rightBranch)
+            get_leaves(curNode)
+        self.pred += (np.array(instance).astype(int) *  np.array(weight)[:, :, np.newaxis]).sum(axis=1).T
+
+        y_pred = 1/(1+np.exp(-self.pred ))
+        y_true = self.y_train
+
+class VFLXGBoost:
+    def __init__(self, bsts:List[SFXGBoost]) -> None:
+        self.bsts = bsts
+        self.config = bsts[0].config
+        self.trees:List[List[SFXGBoostTree]] = deepcopy(bsts[0].trees)
+        self.nUsers = bsts[0].original_data_test.nUsers
+        self.pred = np.zeros((self.nUsers, self.config.nClasses))
+
+        for treesofclass in self.trees:
+            for tree in treesofclass:
+                assert type(tree) == SFXGBoostTree
+                tree.setInstances(self.nUsers, np.full((self.nUsers, ), True))
+
+    def update(self):
+        self.trees = deepcopy(self.bsts[0].trees)
+        for treesofclass in self.trees:
+            for tree in treesofclass:
+                assert type(tree) == SFXGBoostTree
+                tree.setInstances(self.nUsers, np.full((self.nUsers, ), True))
     
+    def predict_proba(self, X, t=None):
+        if t is None:
+            t = len(self.config.max_tree)
+        y_pred = self.predict_weight(X, t)
+        # Step 1: Improve numerical stability
+        y_pred_max = np.max(y_pred, axis=1, keepdims=True)
+        y_pred_stable = y_pred - y_pred_max
+
+        # Step 2: Compute exponential
+        exp_y_pred = np.exp(y_pred_stable)
+
+        # Step 3: Sum exponentials in each row
+        sum_exp_y_pred = np.sum(exp_y_pred, axis=1, keepdims=True)
+
+        # Step 4: Divide each element by the sum of its row
+        y_pred_softmax = exp_y_pred / sum_exp_y_pred
+        
+        return y_pred_softmax
+    
+    def get_child_nodes(self, roots:list[FLTreeNode]):
+        
+        nodes = [[] for _ in range(self.config.nClasses)]
+        for c in range(self.config.nClasses):
+            for root in roots[c]:
+                if root.leftBranch is not None:
+                    nodes[c].append(root.leftBranch)
+                if root.rightBranch is not None:
+                    nodes[c].append(root.rightBranch)
+
+        return nodes
+    
+    def tree_update(self, splits:List[List[SplittingInfo]], instance_list, t, depth):
+        new_nodes = [[] for _ in range(self.config.nClasses)]
+        for c in range(self.config.nClasses):
+            for n, node in enumerate(self.currentNodes[c]):
+                splitInfo = splits[c][n]
+                if splitInfo.isValid and depth < self.config.max_depth:
+                    # node.splittingInfo = splitInfo
+                    # node.leftBranch = FLTreeNode(parent=node)
+                    # node.rightBranch = FLTreeNode(parent=node)
+                    fName = splitInfo.featureName
+                    sValue = splitInfo.splitValue
+                    # print(self.original_data.featureDict.keys())
+                    # if self.config.client != 0:
+                    node.leftBranch.instances = instance_list[c][n][0]
+                    node.rightBranch.instances = instance_list[c][n][1]
+                    new_nodes[c].append(node.leftBranch)
+                    new_nodes[c].append(node.rightBranch)
+                else:
+                    node.weight = splitInfo.weight
+                    node.score = splitInfo.nodeScore
+                    node.leftBranch = None
+                    node.rightBranch = None
+        self.currentNodes = new_nodes
+        return new_nodes
+
+    def predict_weight(self,X, t=None):
+        self.pred = np.zeros((self.nUsers , self.config.nClasses))
+        if t is None:
+            t = len(self.config.max_tree) -1
+        for treeID in range(t + 1):
+            trees = [self.trees[c][treeID] for c in range(self.config.nClasses)]
+            if not trees[0].testsplit:
+                roots = [[trees[c].root] for c in range(self.config.nClasses)]
+                instances_list = [[] for _ in range(self.config.nClasses)]
+
+                # for i in range(len(self.bsts)):
+                #     self.bsts[i].currentNodes = [[self.bsts[i].trees[c][treeID].root] for c in range(self.config.nClasses)]
+
+                parent_instances = [[ np.full((self.nUsers, ),True)] for _ in range(self.config.nClasses)]
+                curNode = roots
+                self.currentNodes = curNode
+                # for c in range(self.config.nClasses):
+                #     instances_list[c] = []
+                    # update_infos = [[node.SplittingInfo for node in curNode[c]] for c in range(self.config.nClasses)]
+                for d in range(self.config.max_depth):  
+                    update_infos = [[node.splittingInfo for node in curNode[c]] for c in range(self.config.nClasses)]                  
+                    for c in range(self.config.nClasses):
+                        instances_list[c] = []
+                        
+                        # for i in range(len(self.bsts)):
+                        #     self.bsts[i].currentNodes
+                        # instances_list.append([])
+                        for n, update_info in enumerate(update_infos[c]):
+                            featureid = update_info.featureId
+                            if update_info.isValid:
+                                if featureid < 20:
+                                    clientid = 0
+                                elif featureid < 40:
+                                    clientid = 1
+                                else:
+                                    clientid = 2
+                                instances_list[c].append(self.bsts[clientid].split_instances_test(update_info, parent_instances[c][n//2][n%2]))
+                
+                    
+                    # for i in range(len(self.bsts)):
+                    #     self.bsts[i].currentNodes = self.get_child_nodes(self.bsts[i].currentNodes)
+                    parent_instances = instances_list.copy()
+                    curNode = self.tree_update(update_infos, instances_list, treeID, d)
+                for c in range(self.config.nClasses):
+                    trees[c].testsplit = True
+
+            instance = [[] for _ in range(self.config.nClasses)]
+            weight = [[] for _ in range(self.config.nClasses)]
+            for c in range(self.config.nClasses):
+                curNode = self.trees[:, treeID][c].root
+                def get_leaves(node):
+                    if node.is_leaf():
+                        instance[c].append(node.instances)
+                        weight[c].append(node.weight)
+                    else:
+                        get_leaves(node.leftBranch)
+                        get_leaves(node.rightBranch)
+                get_leaves(curNode)
+            self.pred += (np.array(instance).astype(int) *  np.array(weight)[:, :, np.newaxis]).sum(axis=1).T
+        return self.pred
